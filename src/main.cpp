@@ -6160,6 +6160,77 @@ static bool read_original(const uint8_t* at, uint32_t n, uint8_t* out) {
     return ok;
 }
 
+// Find `sig` in the executable's .text as stored on disk (the game's original
+// code, before another mod's hook changed it in memory). Reads the file in 1 MB
+// windows so no whole-.text buffer is needed, and returns the RVA of the single
+// match, or 0. Only from the file that is running (same time stamp and image
+// size as the loaded headers).
+static uint32_t find_sig_in_file(const char* name, const char* sig) {
+    uint8_t sigBytes[128]; uint8_t sigMask[128];
+    int sigLen = core::parse_sig(sig, sigBytes, sigMask, 128);
+    if (sigLen <= 0 || sigLen > 64) return 0;   // the window overlap covers 64 bytes
+    wchar_t path[MAX_PATH];
+    DWORD len = GetModuleFileNameW(nullptr, path, MAX_PATH);
+    if (!len || len >= MAX_PATH) { LOG(.str("  ").str(name).str(": the game file's original code could not be read")); return 0; }
+    HANDLE h = CreateFileW(path, GENERIC_READ, FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE, nullptr, OPEN_EXISTING, 0, nullptr);
+    if (h == INVALID_HANDLE_VALUE) { LOG(.str("  ").str(name).str(": the game file's original code could not be read")); return 0; }
+    static uint8_t hdr[0x1000];
+    DWORD got = 0; uint32_t rva = 0;
+    if (ReadFile(h, hdr, sizeof(hdr), &got, nullptr) && got == sizeof(hdr)) {
+        auto* nt = (IMAGE_NT_HEADERS64*)(g_base + ((IMAGE_DOS_HEADER*)g_base)->e_lfanew);
+        uint32_t pe = *(uint32_t*)(hdr + 0x3c);
+        bool ok = false;
+        if (pe + sizeof(IMAGE_NT_HEADERS64) <= got) {
+            auto* fnt = (IMAGE_NT_HEADERS64*)(hdr + pe);
+            ok = fnt->FileHeader.TimeDateStamp == nt->FileHeader.TimeDateStamp &&
+                 fnt->OptionalHeader.SizeOfImage == nt->OptionalHeader.SizeOfImage;
+        }
+        if (!ok) LOG(.str("  ").str(name).str(": the game file's original code could not be read (not the running file)"));
+        else {
+            uint16_t ns = *(uint16_t*)(hdr + pe + 6);
+            uint16_t optsz = *(uint16_t*)(hdr + pe + 20);
+            for (uint16_t i = 0; i < ns; i++) {
+                size_t sh = pe + 24 + optsz + 40 * (size_t)i;
+                if (sh + 40 > got) break;
+                if (memcmp(hdr + sh, ".text", 5) != 0) continue;
+                uint32_t va = *(uint32_t*)(hdr + sh + 12);
+                uint32_t vs = *(uint32_t*)(hdr + sh + 8);
+                uint32_t rs = *(uint32_t*)(hdr + sh + 16);
+                uint32_t ro = *(uint32_t*)(hdr + sh + 20);
+                uint32_t raw = rs < vs ? rs : vs;
+                static uint8_t win[0x100000 + 64];
+                const uint32_t WIN = 0x100000, OV = 64;
+                uint32_t hits[8]; int nHits = 0; bool complete = false;
+                for (uint32_t base = 0; base < raw; ) {
+                    uint32_t start = base == 0 ? 0 : base - OV;
+                    uint32_t end = base + WIN < raw ? base + WIN : raw;
+                    uint32_t n = end - start;
+                    LARGE_INTEGER pos; pos.QuadPart = ro + start;
+                    DWORD g2 = 0;
+                    if (!SetFilePointerEx(h, pos, nullptr, FILE_BEGIN) || !ReadFile(h, win, n, &g2, nullptr) || g2 != n) break;
+                    const uint8_t* h2[8];
+                    int m = core::scan(win, n, sig, h2, 8);
+                    for (int j = 0; j < m && j < 8; j++) {
+                        uint32_t at = start + (uint32_t)(h2[j] - win);
+                        bool dup = false;
+                        for (int q = 0; q < nHits; q++) if (hits[q] == at) dup = true;
+                        if (!dup && nHits < 8) hits[nHits++] = at;
+                    }
+                    if (end == raw) { complete = true; break; }
+                    base += WIN;
+                }
+                if (!complete) LOG(.str("  ").str(name).str(": the game file's original code could not be read"));
+                else if (nHits == 0) LOG(.str("  ").str(name).str(": not in the game file's original code either"));
+                else if (nHits > 1) LOG(.str("  ").str(name).str(": ").i(nHits).str(" matches in the game file's original code"));
+                else rva = va + hits[0];
+                break;   // .text handled; stop looking at sections
+            }
+        }
+    } else LOG(.str("  ").str(name).str(": the game file's original code could not be read"));
+    CloseHandle(h);
+    return rva;
+}
+
 // The call to screen 52's function inside the play-state UI (the target of the screen
 // dispatch's first je). When the dispatch signature does not match (another mod patched
 // those bytes, or a game update changed them), look for it by its shape instead: inside
@@ -6236,12 +6307,31 @@ static uint8_t* find_screen52_call(uint8_t* pu) {
     return found;
 }
 
+// ToggleScreen (toggleHudScreen) when another mod hooked its start: the live
+// signature no longer matches, so find it in the game file's original code
+// instead (same idea as the screen dispatch above). The function at that RVA
+// in live memory starts with the other mod's jump; calling it goes through
+// that hook, which calls the game.
+static uint8_t* find_toggle_screen() {
+    if (uint8_t* t = find_unique("ToggleScreen", SIG_TOGGLE_SCREEN)) return t;
+    uint32_t rva = find_sig_in_file("ToggleScreen", SIG_TOGGLE_SCREEN);
+    if (!rva) return nullptr;
+    uint8_t* fn = g_base + rva;
+    if (readable(fn, 16)) log_bytes("  ToggleScreen: live bytes at", fn, 16);
+    if (readable(fn, 16) && core::is_hook_jump(fn)) {
+        LOG(.str("  ToggleScreen: found in the game file's original code at rva ").x(rva).str(", hooked by another mod; chained"));
+        return fn;
+    }
+    LOG(.str("  ToggleScreen: in the game file's original code at rva ").x(rva).str(", changed by another mod; not used"));
+    return nullptr;
+}
+
 static void install_menu() {
     uint8_t* call = find_unique("PlayUiCall", SIG_PLAY_UI_CALL);
     uint8_t* site = call ? call + 2 : nullptr;
     uint8_t* pu = call ? find_play_ui() : nullptr;
     uint8_t* s52 = find_screen52_call(pu);
-    g_toggleScreen = (ToggleScreenFn)find_unique("ToggleScreen", SIG_TOGGLE_SCREEN);
+    g_toggleScreen = (ToggleScreenFn)find_toggle_screen();
     if (!pu || !call || !s52 || !g_toggleScreen) { LOG(.str("menu: not available (UI code not found)")); return; }
     // the call reaches the play-state UI, or another mod's hook that took the call over
     uint8_t* callee = site + 5 + *(int32_t*)(site + 1);

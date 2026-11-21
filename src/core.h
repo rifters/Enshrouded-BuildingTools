@@ -123,6 +123,17 @@ inline int call_site_state(const uint8_t* orig, const uint8_t* live, const uint8
     return t < lo || t >= hi ? CALL_SITE_REDIRECTED : CALL_SITE_CHANGED;
 }
 
+// A function start another mod hooked: its first bytes are a jump to the other
+// mod's code (E9 rel32, FF 25 [rip], or mov rax/r11, imm64; jmp rax/r11 as the
+// GreeneyeDS loader writes). Calling it goes through that hook, which calls
+// the game — the same chaining find_hookable relies on. Needs 13 readable
+// bytes at `p`.
+inline bool is_hook_jump(const uint8_t* p) {
+    return p[0] == 0xE9 || (p[0] == 0xFF && p[1] == 0x25) ||
+           (p[0] == 0x48 && p[1] == 0xB8 && p[10] == 0xFF && p[11] == 0xE0) ||
+           (p[0] == 0x49 && p[1] == 0xBB && p[10] == 0x41 && p[11] == 0xFF && p[12] == 0xE3);
+}
+
 // --------------------------------------------------------------- game layout
 // World positions are signed 64-bit fixed point, 1 m == 2^32.
 static const double kFix = 4294967296.0;

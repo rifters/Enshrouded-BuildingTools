@@ -32,6 +32,9 @@ over its `sub ecx,34h` and the screen 52 `je`), which hides the dispatcher's sig
 the mod then finds the dispatcher in the original code read from `enshrouded.exe` on disk
 (only when the file is the one running) and uses the screen 52 call when it is still the
 game's call there, or another mod's redirected call. The log says which way it was found.
+The same disk lookup covers toggleHudScreen: when another mod hooks its start (so its
+signature no longer matches), the mod finds it in the original code and calls it through
+that mod's hook, which chains to the game.
 
 The DLL also works when loaded by another loader (for example as `BuildingTools.dll`
 listed in the XHL Native Core's `dinput8-chain.ini`, or by Shroudforge from

@@ -157,6 +157,32 @@ static void binary_checks(const char* exe) {
         lpu[at] = 0xE9; memcpy(lpu + at + 1, keep + 1, 4);
         CHECK(core::call_site_state(&img[pu + at], lpu + at, lo, hi) == core::CALL_SITE_CHANGED, "screen 52 call replaced by a jmp -> refused");
     }
+    {   // menu: ToggleScreen found in the game file's original code when another mod hooked its start
+        // (its first 5 bytes become a jump, so the live signature no longer matches)
+        const uint32_t tgl = 0xd74850;
+        const uint8_t* hits[2];
+        CHECK(core::scan(&img[textVa], textSz, sigs["SIG_TOGGLE_SCREEN"].c_str(), hits, 2) == 1 && hits[0] == &img[tgl],
+              "toggle screen at rva 0xd74850 (original code)");
+        std::vector<uint8_t> live(img.begin() + textVa, img.begin() + textVa + textSz);   // the .text as another mod left it
+        uint8_t* lt = &live[tgl - textVa];
+        CHECK(!core::is_hook_jump(lt), "toggle screen start is not a hook jump (original code)");
+        lt[0] = 0xE9; memset(lt + 1, 0x22, 4);   // a 5-byte jmp over the prologue (another mod's hook)
+        CHECK(core::scan(live.data(), live.size(), sigs["SIG_TOGGLE_SCREEN"].c_str(), hits, 2) == 0,
+              "hooked toggle screen: the signature no longer matches the live code (the bug)");
+        CHECK(core::is_hook_jump(lt), "hooked toggle screen: its start is a jump -> chained");
+        CHECK(core::scan(&img[textVa], textSz, sigs["SIG_TOGGLE_SCREEN"].c_str(), hits, 2) == 1 && hits[0] == &img[tgl],
+              "hooked toggle screen: found in the original code");
+        lt[0] = 0x90; memset(lt + 1, 0x90, 4);   // a changed start that is not a jump
+        CHECK(!core::is_hook_jump(lt), "toggle screen start replaced by nops -> not a hook jump, refused");
+        uint8_t ff[16] = {0xFF, 0x25, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0};
+        CHECK(core::is_hook_jump(ff), "is_hook_jump: FF 25 [rip+0] is a hook jump");
+        uint8_t mj[16] = {0x48, 0xB8, 1, 2, 3, 4, 5, 6, 7, 8, 0xFF, 0xE0, 0, 0, 0, 0};
+        CHECK(core::is_hook_jump(mj), "is_hook_jump: mov rax,imm64; jmp rax is a hook jump");
+        uint8_t mj2[16] = {0x49, 0xBB, 1, 2, 3, 4, 5, 6, 7, 8, 0x41, 0xFF, 0xE3, 0, 0, 0};
+        CHECK(core::is_hook_jump(mj2), "is_hook_jump: mov r11,imm64; jmp r11 is a hook jump");
+        uint8_t plain[16] = {0x48, 0x89, 0x5C, 0x24, 0x10, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0};
+        CHECK(!core::is_hook_jump(plain), "is_hook_jump: the original prologue is not a hook jump");
+    }
 
 }
 
