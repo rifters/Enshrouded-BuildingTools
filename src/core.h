@@ -69,6 +69,60 @@ inline int find_calls_to(const uint8_t* fn, size_t len, const uint8_t* target, c
     return found;
 }
 
+// ------------------------------------------------- original code (game file)
+// Other mods patch the game's code in memory, so a signature can fail where only another
+// mod's hook changed the bytes. The executable on disk still has the original code; these
+// helpers find it there. `hdr` holds the file's first `hdrLen` bytes (DOS + PE headers
+// and the section table). Writes the file offset of [rva, rva + len) and returns true when
+// that range lies inside one section's raw data.
+inline bool pe_file_offset(const uint8_t* hdr, size_t hdrLen, uint32_t rva, uint32_t len, uint32_t* off) {
+    auto u16 = [&](size_t o) { return (uint32_t)hdr[o] | (uint32_t)hdr[o + 1] << 8; };
+    auto u32 = [&](size_t o) { return u16(o) | u16(o + 2) << 16; };
+    if (hdrLen < 0x40 || hdr[0] != 'M' || hdr[1] != 'Z') return false;
+    size_t pe = u32(0x3c);
+    if (pe + 24 > hdrLen || u32(pe) != 0x4550) return false;            // "PE\0\0"
+    uint32_t ns = u16(pe + 6), optsz = u16(pe + 20);
+    for (uint32_t i = 0; i < ns; i++) {
+        size_t sh = pe + 24 + optsz + 40 * (size_t)i;
+        if (sh + 40 > hdrLen) return false;
+        uint32_t vs = u32(sh + 8), va = u32(sh + 12), rs = u32(sh + 16), ro = u32(sh + 20);
+        uint32_t raw = rs < vs ? rs : vs;
+        if (rva >= va && (uint64_t)rva + len <= (uint64_t)va + raw) { *off = ro + (rva - va); return true; }
+    }
+    return false;
+}
+
+// The play-state UI's screen dispatch ("mov rax,[rbp-80h]; movzx ecx,byte [rax];
+// sub ecx,34h; je <screen 52 call>; cmp ecx,1; je ..."), matched once in `code` (the
+// function's bytes, usually the original ones from the game file). Returns the offset in
+// `code` of the screen 52 call its first je reaches (and the dispatch's in *dispatchAt), or -1.
+inline long screen52_call_in(const uint8_t* code, size_t len, const char* dispatchSig, long* dispatchAt = nullptr) {
+    const uint8_t* hits[2];
+    if (!code || scan(code, len, dispatchSig, hits, 2) != 1) return -1;
+    if (dispatchAt) *dispatchAt = (long)(hits[0] - code);
+    const uint8_t* je = hits[0] + 10;
+    if (je + 6 > code + len || je[0] != 0x0F || je[1] != 0x84) return -1;
+    int32_t rel = (int32_t)((uint32_t)je[2] | (uint32_t)je[3] << 8 | (uint32_t)je[4] << 16 | (uint32_t)je[5] << 24);
+    long at = (long)(je + 6 - code) + rel;
+    if (at < 0 || (size_t)at + 5 > len || code[at] != 0xE8) return -1;
+    return at;
+}
+
+// A call site as it runs now (`live`) next to the game's original bytes (`orig`, an E8
+// rel32): CALL_SITE_SAME when unchanged, CALL_SITE_REDIRECTED when another mod pointed the
+// call at its own code (an E8 to outside the game's code [lo, hi); calling what it reaches
+// goes through that mod, which calls the game), CALL_SITE_CHANGED for anything else.
+enum { CALL_SITE_CHANGED = 0, CALL_SITE_SAME = 1, CALL_SITE_REDIRECTED = 2 };
+inline int call_site_state(const uint8_t* orig, const uint8_t* live, const uint8_t* lo, const uint8_t* hi) {
+    if (orig[0] != 0xE8 || live[0] != 0xE8) return CALL_SITE_CHANGED;
+    int k = 1;
+    while (k < 5 && orig[k] == live[k]) k++;
+    if (k == 5) return CALL_SITE_SAME;
+    int32_t rel = (int32_t)((uint32_t)live[1] | (uint32_t)live[2] << 8 | (uint32_t)live[3] << 16 | (uint32_t)live[4] << 24);
+    const uint8_t* t = live + 5 + rel;
+    return t < lo || t >= hi ? CALL_SITE_REDIRECTED : CALL_SITE_CHANGED;
+}
+
 // --------------------------------------------------------------- game layout
 // World positions are signed 64-bit fixed point, 1 m == 2^32.
 static const double kFix = 4294967296.0;

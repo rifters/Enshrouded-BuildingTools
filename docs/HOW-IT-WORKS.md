@@ -27,7 +27,11 @@ retargets the `call` instructions that reach them instead, so both mods work whi
 starts first. The play-state UI (the menu's entry point) is reached the same way, through
 its one call; Find and The Worst Map Mod hook its first bytes, so when its signature does
 not match the mod looks for it with the 18-byte prologue left out and calls whatever the
-call reached before.
+call reached before. Creative Mode 3.2 hooks the play UI's screen dispatcher itself (a jump
+over its `sub ecx,34h` and the screen 52 `je`), which hides the dispatcher's signature;
+the mod then finds the dispatcher in the original code read from `enshrouded.exe` on disk
+(only when the file is the one running) and uses the screen 52 call when it is still the
+game's call there, or another mod's redirected call. The log says which way it was found.
 
 The DLL also works when loaded by another loader (for example as `BuildingTools.dll`
 listed in the XHL Native Core's `dinput8-chain.ini`, or by Shroudforge from

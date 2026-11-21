@@ -6133,11 +6133,43 @@ static void log_bytes(const char* what, const uint8_t* p, int n) {
     log_line(b);
 }
 
+// The game's original code for [at, at + n) of its .text, read from the executable on
+// disk: another mod's hook may have changed those bytes in memory. Only from the file
+// that is running (same time stamp and image size as the loaded headers).
+static bool read_original(const uint8_t* at, uint32_t n, uint8_t* out) {
+    if (!g_textBase || at < g_textBase || at + n > g_textBase + g_textSize) return false;
+    wchar_t path[MAX_PATH];
+    DWORD len = GetModuleFileNameW(nullptr, path, MAX_PATH);
+    if (!len || len >= MAX_PATH) return false;
+    HANDLE h = CreateFileW(path, GENERIC_READ, FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE, nullptr, OPEN_EXISTING, 0, nullptr);
+    if (h == INVALID_HANDLE_VALUE) return false;
+    static uint8_t hdr[0x1000];
+    DWORD got = 0; uint32_t off = 0; bool ok = false;
+    auto* nt = (IMAGE_NT_HEADERS64*)(g_base + ((IMAGE_DOS_HEADER*)g_base)->e_lfanew);
+    if (ReadFile(h, hdr, sizeof(hdr), &got, nullptr) && got == sizeof(hdr) &&
+        core::pe_file_offset(hdr, got, (uint32_t)(at - g_base), n, &off)) {
+        uint32_t pe = *(uint32_t*)(hdr + 0x3c);
+        auto* fnt = (IMAGE_NT_HEADERS64*)(hdr + pe);
+        ok = pe + sizeof(IMAGE_NT_HEADERS64) <= got &&
+             fnt->FileHeader.TimeDateStamp == nt->FileHeader.TimeDateStamp &&
+             fnt->OptionalHeader.SizeOfImage == nt->OptionalHeader.SizeOfImage;
+        LARGE_INTEGER pos; pos.QuadPart = off;
+        ok = ok && SetFilePointerEx(h, pos, nullptr, FILE_BEGIN) && ReadFile(h, out, n, &got, nullptr) && got == n;
+    }
+    CloseHandle(h);
+    return ok;
+}
+
 // The call to screen 52's function inside the play-state UI (the target of the screen
 // dispatch's first je). When the dispatch signature does not match (another mod patched
 // those bytes, or a game update changed them), look for it by its shape instead: inside
 // the play-state UI, "E8 <screen 53> EB xx E8 <screen 52>" with both calls reaching
 // function starts, and a je in the same function jumping to each of the two calls.
+// Creative Mode (3.2) hooks the dispatch itself ("hud.modeDispatch": its sub ecx,34h and
+// the screen 52 je become a jump to its code), which hides both the signature and that je;
+// then the dispatch is found in the game file's original code, and the screen 52 call is
+// used when it is still the game's call there (or another mod's redirected call).
+static const char* g_dispatchVia = "the live code";
 static uint8_t* find_screen52_call(uint8_t* pu) {
     if (uint8_t* disp = find_unique("ScreenDispatch", SIG_SCREEN_DISPATCH)) {
         uint8_t* je = disp + 10;                                 // 0F 84 rel32 -> E8 <screen 52>
@@ -6148,6 +6180,26 @@ static uint8_t* find_screen52_call(uint8_t* pu) {
     // window: on 1.0.1.1 the dispatch is at +0x64b and the screen 52 call at +0xe5e
     uint8_t* end = pu + 0x2000;
     if (end > g_textBase + g_textSize) end = g_textBase + g_textSize;
+    {
+        static uint8_t orig[0x2000];
+        uint32_t len = (uint32_t)(end - pu);
+        long dispAt = -1, at = -1;
+        if (!read_original(pu, len, orig)) LOG(.str("  ScreenDispatch: the game file's original code could not be read"));
+        else if ((at = core::screen52_call_in(orig, len, SIG_SCREEN_DISPATCH, &dispAt)) < 0)
+            LOG(.str("  ScreenDispatch: not in the game file's original code either"));
+        else {
+            uint8_t* s52 = pu + at;
+            int st = core::call_site_state(orig + at, s52, g_textBase, g_textBase + g_textSize);
+            log_bytes("  ScreenDispatch: live bytes at", pu + dispAt, 21);
+            Buf b; b.str("  ScreenDispatch: found in the game file's original code at rva ").x((uint64_t)(pu + dispAt - g_base))
+                     .str(", screen 52 call at rva ").x((uint64_t)(s52 - g_base));
+            b.str(st == core::CALL_SITE_SAME ? " unchanged; used"
+                  : st == core::CALL_SITE_REDIRECTED ? " redirected by another mod; chained"
+                  : " changed by another mod; not used");
+            log_line(b);
+            if (st != core::CALL_SITE_CHANGED) { g_dispatchVia = "the game file's original code"; return s52; }
+        }
+    }
     auto jumped_to = [&](const uint8_t* t) {
         for (uint8_t* p = pu; p + 6 <= end; p++)
             if (p[0] == 0x0F && p[1] == 0x84 && p + 6 + *(int32_t*)(p + 2) == t) return p;
@@ -6180,6 +6232,7 @@ static uint8_t* find_screen52_call(uint8_t* pu) {
         return nullptr;
     }
     log_bytes("  ScreenDispatch: signature changed, found by its shape; je at", foundJe - 12, 30);
+    g_dispatchVia = "its shape";
     return found;
 }
 
@@ -6272,7 +6325,7 @@ static void install_menu() {
         hook_calls(callee, (void*)&play_ui_hook, &site, 1) != 1) {
         LOG(.str("menu: not available (hook failed)")); g_playUiOrig = nullptr; return;
     }
-    LOG(.str("menu: available (screen 52)"));
+    LOG(.str("menu: available (screen 52; screen dispatch from ").str(g_dispatchVia).c(')'));
     install_hud_rows();
 }
 

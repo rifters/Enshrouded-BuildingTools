@@ -124,6 +124,39 @@ static void binary_checks(const char* exe) {
       CHECK(!memcmp(&img[0x2994d0], "\x48\x89\x5C\x24\x18\x4C\x89\x4C\x24\x20", 10), "props: placement check prologue"); }
     // call-site distance check used by the mod
     CHECK(0x2d8943 > 0x2d85fb && 0x2d8943 - 0x2d85fb < 0x400, "call-site layout check passes");
+    {   // menu: the screen dispatch found in the game file's original code when another mod hooked it
+        // (Creative Mode 3.2's "hud.modeDispatch" at play-state UI +0x652: sub ecx,34h + je -> jmp + nops)
+        const uint32_t pu = 0xc603d0, win = 0x2000;
+        std::vector<uint8_t> hdr(file.begin(), file.begin() + 0x1000);
+        uint32_t off = 0;
+        CHECK(core::pe_file_offset(hdr.data(), hdr.size(), pu, win, &off) && !memcmp(&file[off], &img[pu], win),
+              "original code: file offset of the play-state UI window maps to its mapped bytes");
+        CHECK(!core::pe_file_offset(hdr.data(), hdr.size(), textVa + textSz - 4, 0x10, &off), "original code: a range past .text's raw data is refused");
+        const uint8_t* hits[2];
+        CHECK(core::scan(&img[textVa], textSz, sigs["SIG_PLAY_UI"].c_str(), hits, 2) == 1 && hits[0] == &img[pu], "play-state UI at rva 0xc603d0");
+        const char* dsig = sigs["SIG_SCREEN_DISPATCH"].c_str();
+        long dispAt = -1;
+        long at = core::screen52_call_in(&img[pu], win, dsig, &dispAt);
+        CHECK(at == 0xe5e && dispAt == 0x64b, "screen dispatch at +0x64b, screen 52 call at +0xe5e (original code)");
+        std::vector<uint8_t> live(img.begin() + textVa, img.begin() + textVa + textSz);   // the .text as another mod left it
+        uint8_t* lpu = &live[pu - textVa];
+        const uint8_t* lo = live.data(); const uint8_t* hi = live.data() + live.size();
+        lpu[0x652] = 0xE9; memset(lpu + 0x653, 0x11, 4); memset(lpu + 0x657, 0x90, 4);  // jmp <hook> over sub/je (9 bytes)
+        lpu[0] = 0xE9; memset(lpu + 1, 0x22, 4);                                        // and the start hooked (ShroudLink addon)
+        CHECK(core::scan(lo, live.size(), dsig, hits, 2) == 0, "hooked dispatch: the signature no longer matches the live code (the bug)");
+        CHECK(core::screen52_call_in(lpu, win, dsig) < 0, "hooked dispatch: not found in the live play-state UI either");
+        CHECK(core::screen52_call_in(&img[pu], win, dsig) == 0xe5e, "hooked dispatch: found in the original code");
+        CHECK(core::call_site_state(&img[pu + at], lpu + at, lo, hi) == core::CALL_SITE_SAME, "hooked dispatch: screen 52 call unchanged -> used");
+        uint8_t keep[5]; memcpy(keep, lpu + at, 5);
+        int32_t far = 0x7ff00000;                                                       // a call into another module
+        memcpy(lpu + at + 1, &far, 4);
+        CHECK(core::call_site_state(&img[pu + at], lpu + at, lo, hi) == core::CALL_SITE_REDIRECTED, "screen 52 call redirected out of the game's code -> chained");
+        int32_t inside = 0x100;
+        memcpy(lpu + at + 1, &inside, 4);
+        CHECK(core::call_site_state(&img[pu + at], lpu + at, lo, hi) == core::CALL_SITE_CHANGED, "screen 52 call moved inside the game's code -> refused");
+        lpu[at] = 0xE9; memcpy(lpu + at + 1, keep + 1, 4);
+        CHECK(core::call_site_state(&img[pu + at], lpu + at, lo, hi) == core::CALL_SITE_CHANGED, "screen 52 call replaced by a jmp -> refused");
+    }
 
 }
 
@@ -208,6 +241,38 @@ int main(int argc, char** argv) {
         put(0x100, target);
         CHECK(core::find_calls_to(fn, sizeof(fn), target, sites, 2) == 3, "find_calls_to: counts past cap (caller refuses 3)");
         CHECK(core::find_calls_to(fn, 4, target, sites, 2) == 0 && core::find_calls_to(nullptr, 16, target, sites, 2) == 0, "find_calls_to: short/null range");
+    }
+    {   // screen dispatch in original code (no game file needed)
+        uint8_t code[0x100] = {};
+        const uint8_t disp[16] = {0x48,0x8B,0x45,0x80,0x0F,0xB6,0x08,0x83,0xE9,0x34,0x0F,0x84,0,0,0,0};
+        const char* dsig = "48 8B 45 80 0F B6 08 83 E9 34 0F 84 ?? ?? ?? ?? 83 F9 01 0F 84";
+        memcpy(code + 0x20, disp, 16);
+        int32_t rel = 0xc0 - (0x20 + 16); memcpy(code + 0x2c, &rel, 4);
+        code[0x30] = 0x83; code[0x31] = 0xF9; code[0x32] = 0x01; code[0x33] = 0x0F; code[0x34] = 0x84;
+        code[0xc0] = 0xE8;
+        long dAt = -1;
+        CHECK(core::screen52_call_in(code, sizeof code, dsig, &dAt) == 0xc0 && dAt == 0x20, "screen52_call_in: je target is the call");
+        code[0xc0] = 0x90;
+        CHECK(core::screen52_call_in(code, sizeof code, dsig) == -1, "screen52_call_in: je target not a call -> -1");
+        code[0xc0] = 0xE8; rel = 0x1000; memcpy(code + 0x2c, &rel, 4);
+        CHECK(core::screen52_call_in(code, sizeof code, dsig) == -1, "screen52_call_in: je target outside the window -> -1");
+        rel = 0xc0 - (0x20 + 16); memcpy(code + 0x2c, &rel, 4);
+        memcpy(code + 0x60, code + 0x20, 0x15);
+        CHECK(core::screen52_call_in(code, sizeof code, dsig) == -1, "screen52_call_in: two dispatches -> -1");
+        CHECK(core::screen52_call_in(nullptr, 0, dsig) == -1, "screen52_call_in: no code -> -1");
+        uint8_t hdr[0x200] = {};
+        hdr[0] = 'M'; hdr[1] = 'Z'; hdr[0x3c] = 0x80;
+        memcpy(hdr + 0x80, "PE\0\0", 4); hdr[0x86] = 1; hdr[0x94] = 0xF0;                  // 1 section, optional header 0xF0
+        uint8_t* sh = hdr + 0x80 + 24 + 0xF0;
+        memcpy(sh, ".text", 5);
+        uint32_t f[4] = {0x5000, 0x1000, 0x4800, 0x400};                                    // vsize, va, raw size, raw offset
+        memcpy(sh + 8, f, 16);
+        uint32_t off = 0;
+        CHECK(core::pe_file_offset(hdr, sizeof hdr, 0x1100, 0x100, &off) && off == 0x500, "pe_file_offset: rva to file offset");
+        CHECK(!core::pe_file_offset(hdr, sizeof hdr, 0x5700, 0x200, &off), "pe_file_offset: past the raw data -> refused");
+        CHECK(!core::pe_file_offset(hdr, 0x100, 0x1100, 0x10, &off), "pe_file_offset: section table cut off -> refused");
+        hdr[0] = 'X';
+        CHECK(!core::pe_file_offset(hdr, sizeof hdr, 0x1100, 0x10, &off), "pe_file_offset: not a PE file -> refused");
     }
     core::Plan pl;
     // line of 5 blocks along x (corners 0 and 8 m; 3rd click repeats corner 2)
